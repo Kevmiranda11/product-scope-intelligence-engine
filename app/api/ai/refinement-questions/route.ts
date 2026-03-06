@@ -24,11 +24,28 @@ export async function POST(request: NextRequest) {
     const result = await generateStructuredOutput<RefinementQuestionsResponse>({
       schemaName: 'refinement_questions_response',
       schema: refinementQuestionsResponseSchema,
-      systemPrompt:
-        'Generate focused Frontend, Backend, and QA refinement questions for each selected story. Output schema-compliant JSON only.',
+      systemPrompt: [
+        'You are a senior product refinement partner for Step 4.',
+        'Generate the smallest number of highest-value questions needed to resolve ambiguity for a Product Owner/Product Manager.',
+        'Quality over quantity: ask fewer questions if context is already clear.',
+        'Hard limits: maximum 2 questions per role and 6 total questions across all roles.',
+        'Questions must be decision-grade, senior-level, and materially improve scope clarity.',
+        'Avoid filler, obvious, or repetitive questions.',
+        'Avoid low-level implementation detail unless translated into product/business language.',
+        'Assume a prototype/design may already exist; avoid visual/layout detail questions unless behavior is unresolved.',
+        'If relevant, ask at most one gating prototype question.',
+        'Do not ask questions that a tech lead should decide internally without product input.',
+        'Ask about business rules, constraints, ownership, permissions, edge cases, timing, success/failure behavior, moderation, audit/history, cross-workspace impacts, irreversible actions, and dependencies.',
+        'Frontend/Flutter: only user-facing behavior, states, confirmations, visibility rules, prototype ambiguity, interaction edge cases.',
+        'Backend: only business-rule and persistence expectations phrased in product language (history/audit, integrations, uniqueness, constraints, operational behavior).',
+        'QA: only negative paths, misuse/abuse, acceptance boundaries, special cases, and must-validate before release.',
+        'Do not ask questions already clearly answered by the provided context.',
+        'Keep each question concise and specific.',
+        'Return strict schema-compliant JSON only.',
+      ].join(' '),
       userPayload: {
-        task: 'step_4_refinement_questions_placeholder',
-        projectContext: body,
+        task: 'step_4_refinement_questions',
+        input: body,
       },
     });
 

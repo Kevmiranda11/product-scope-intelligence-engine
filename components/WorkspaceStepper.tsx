@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useScope } from '@/lib/scope-context';
 import DeleteProjectModal from './DeleteProjectModal';
 
@@ -37,6 +37,7 @@ export default function WorkspaceStepper() {
     ...activeProject,
     refinementQuestionsByStoryId: activeProject.refinementQuestionsByStoryId ?? {},
     refinedOutputByStoryId: activeProject.refinedOutputByStoryId ?? {},
+    finalOutputByStoryId: activeProject.finalOutputByStoryId ?? {},
     storyCandidates: activeProject.storyCandidates ?? [],
     customStories: activeProject.customStories ?? [],
     selectedStoryIds: activeProject.selectedStoryIds ?? [],
@@ -237,7 +238,7 @@ function StepContext() {
 }
 
 function StepStoryBreakdown() {
-  const { activeProject, generateStoryCandidates } = useScope();
+  const { activeProject, generateStoryCandidates, isGeneratingStoryCandidates } = useScope();
 
   if (!activeProject) return null;
 
@@ -261,14 +262,14 @@ function StepStoryBreakdown() {
 
       <button
         onClick={generateStoryCandidates}
-        disabled={!isContextBriefValid}
+        disabled={!isContextBriefValid || isGeneratingStoryCandidates}
         className={`px-4 py-2 text-sm font-medium rounded-md transition-colors mb-6 ${
-          isContextBriefValid
+          isContextBriefValid && !isGeneratingStoryCandidates
             ? 'bg-[#3F46E1] text-white border border-[#3F46E1] hover:bg-[#4F51E1] focus:outline-none focus:ring-1 focus:ring-[#3F46E1]'
             : 'bg-[#1C212B] text-[#6B7280] border border-[#262C36] cursor-not-allowed'
         }`}
       >
-        Generate Candidates
+        {isGeneratingStoryCandidates ? 'Generating...' : 'Generate Candidates'}
       </button>
 
       {lastGeneratedAt && (
@@ -291,6 +292,9 @@ function StepStoryBreakdown() {
               className="p-4 rounded-md bg-[#1C212B] border border-[#262C36] text-[#E5E7EB] hover:border-[#3F46E1] transition-colors"
             >
               <p className="text-sm">{story.title}</p>
+              {story.summary && (
+                <p className="text-xs text-[#9CA3AF] mt-1">{story.summary}</p>
+              )}
             </div>
           ))}
         </div>
@@ -300,14 +304,95 @@ function StepStoryBreakdown() {
 }
 
 function StepSelection() {
-  const { activeProject, toggleStorySelection, addCustomStory, removeCustomStory } = useScope();
+  const {
+    activeProject,
+    toggleStorySelection,
+    addCustomStory,
+    removeCustomStory,
+    analyzeSelectionCoverage,
+    isAnalyzingSelectionCoverage,
+    generateScopeScoreExplanation,
+    isGeneratingScopeScoreExplanation,
+  } = useScope();
   const [customStoryInput, setCustomStoryInput] = useState('');
+
+  const selectionAnalysisKey = activeProject
+    ? `${activeProject.contextBrief.trim().toLowerCase()}::${[...activeProject.storyCandidates, ...activeProject.customStories]
+        .filter((story) => activeProject.selectedStoryIds.includes(story.id))
+        .map((story) => `${story.title.trim().toLowerCase()}::${(story.summary ?? '').trim().toLowerCase()}`)
+        .sort()
+        .join('|')}`
+    : 'no-active-project';
+
+  useEffect(() => {
+    if (activeProject && activeProject.selectedStoryIds.length > 0 && activeProject.lastSelectionAnalysisStateKey !== selectionAnalysisKey) {
+      void analyzeSelectionCoverage();
+    }
+    // Step 3: auto-run once on entering this step when analysis is stale/missing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id]);
 
   if (!activeProject) return null;
 
-  const { storyCandidates, customStories, selectedStoryIds, scopeConfidence, missingScopeSignals } = activeProject;
+  const {
+    storyCandidates,
+    customStories,
+    selectedStoryIds,
+    scopeConfidence,
+    missingScopeSignals,
+    suggestedStories,
+    scopeScoreExplanation,
+  } =
+    activeProject;
   const allStories = [...storyCandidates, ...customStories];
   const keptCount = selectedStoryIds.length;
+  const isSelectionAnalysisStale = activeProject.lastSelectionAnalysisStateKey !== selectionAnalysisKey;
+  const effectiveMissingScopeSignals = isSelectionAnalysisStale ? [] : missingScopeSignals;
+  const effectiveSuggestedStories = isSelectionAnalysisStale ? [] : suggestedStories;
+
+  const fallbackFinalChecks = [
+    'Confirm validation and error-handling behavior for key user actions.',
+    'Review permissions and access boundaries for sensitive workflows.',
+    'Test edge-case user flows, including empty states and partial inputs.',
+    'Verify success and failure feedback messages are clear and actionable.',
+  ];
+
+  const prioritizedMissingChecks = effectiveMissingScopeSignals.map(
+    (signal) => `${signal.title}: ${signal.description}`
+  );
+  const prioritizedSuggestedChecks = effectiveSuggestedStories.map(
+    (story) => `Evaluate adding "${story.title}" to close remaining scope gaps.`
+  );
+
+  let finalChecksHeadline = 'Some important checks are still recommended';
+  let finalChecksHelperText = 'A quick final pass now can prevent avoidable rework later.';
+  let finalChecksToneClasses = 'border-[#5E4A1F] bg-[#2A2315]';
+  let finalChecksTitleClasses = 'text-[#FBBF24]';
+
+  if (scopeConfidence >= 90) {
+    finalChecksHeadline = 'Strong coverage - minor checks recommended';
+    finalChecksHelperText = 'Coverage looks strong, but these quick checks can reduce downstream surprises.';
+    finalChecksToneClasses = 'border-[#1F3B2F] bg-[#15261E]';
+    finalChecksTitleClasses = 'text-[#34D399]';
+  } else if (scopeConfidence < 70) {
+    finalChecksHeadline = 'Scope gaps likely require attention before moving forward';
+    finalChecksHelperText = 'Review the remaining gaps and suggested additions before finalizing this step.';
+    finalChecksToneClasses = 'border-[#5F2C2C] bg-[#2C1C1C]';
+    finalChecksTitleClasses = 'text-[#F87171]';
+  }
+
+  const recommendedFinalChecks = [
+    ...prioritizedMissingChecks,
+    ...prioritizedSuggestedChecks,
+    ...fallbackFinalChecks,
+  ]
+    .filter((check, index, arr) => arr.indexOf(check) === index)
+    .slice(0, 4);
+
+  const normalizedFinalChecks =
+    recommendedFinalChecks.length >= 2
+      ? recommendedFinalChecks
+      : [...recommendedFinalChecks, ...fallbackFinalChecks].slice(0, 2);
 
   const handleAddCustomStory = () => {
     if (customStoryInput.trim()) {
@@ -348,6 +433,57 @@ function StepSelection() {
             style={{ width: `${scopeConfidence}%` }}
           />
         </div>
+        {isAnalyzingSelectionCoverage && (
+          <p className="text-xs text-[#9CA3AF] mt-3">Analyzing selected stories...</p>
+        )}
+        <div className="flex items-center gap-3 mt-3">
+          <button
+            onClick={() => void analyzeSelectionCoverage()}
+            disabled={isAnalyzingSelectionCoverage}
+            className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
+              isAnalyzingSelectionCoverage
+                ? 'bg-[#1C212B] text-[#6B7280] border-[#262C36] cursor-not-allowed'
+                : 'bg-[#0F1115] text-[#E5E7EB] border-[#262C36] hover:border-[#3F46E1] hover:text-white'
+            }`}
+          >
+            Re-analyze Scope
+          </button>
+        </div>
+        {!scopeScoreExplanation ? (
+          <div className="mt-3">
+            <button
+              onClick={() => void generateScopeScoreExplanation()}
+              disabled={isGeneratingScopeScoreExplanation || selectedStoryIds.length === 0}
+              className={`text-xs font-medium transition-colors ${
+                isGeneratingScopeScoreExplanation || selectedStoryIds.length === 0
+                  ? 'text-[#6B7280] cursor-not-allowed'
+                  : 'text-[#9CA3AF] hover:text-[#E5E7EB]'
+              }`}
+            >
+              {isGeneratingScopeScoreExplanation ? 'Generating explanation...' : 'Why did I get this score?'}
+            </button>
+          </div>
+        ) : (
+          <div className="mt-3 p-3 rounded-md bg-[#0F1115] border border-[#262C36]">
+            <p className="text-xs text-[#9CA3AF]">{scopeScoreExplanation}</p>
+          </div>
+        )}
+      </div>
+
+      {/* Recommended Final Checks */}
+      <div className={`mb-6 p-4 rounded-md border ${finalChecksToneClasses}`}>
+        <p className={`text-sm font-medium mb-1 ${finalChecksTitleClasses}`}>Recommended Final Checks</p>
+        <p className="text-xs text-[#9CA3AF] mb-4">
+          {finalChecksHeadline}. {finalChecksHelperText}
+          {isSelectionAnalysisStale ? ' Re-analyze scope after recent selection changes for refreshed guidance.' : ''}
+        </p>
+        <ul className="list-disc list-inside space-y-2">
+          {normalizedFinalChecks.map((check, index) => (
+            <li key={`${check}-${index}`} className="text-sm text-[#E5E7EB]">
+              {check}
+            </li>
+          ))}
+        </ul>
       </div>
 
       {/* Story List */}
@@ -431,14 +567,14 @@ function StepSelection() {
         <div className="p-4 rounded-md border border-[#5F2C2C] bg-[#2C1C1C]">
           <p className="text-sm font-medium text-[#F87171] mb-4">Missing Scope Signals</p>
           <div className="space-y-3">
-            {missingScopeSignals.map((signal) => (
-              <div key={signal.id} className="text-sm">
+            {missingScopeSignals.map((signal, index) => (
+              <div key={`${signal.title}-${index}`} className="text-sm">
                 <div className="flex items-start gap-2">
                   <span
                     className={`inline-block px-2 py-0.5 rounded text-xs font-medium flex-shrink-0 ${
                       signal.severity === 'high'
                         ? 'bg-[#EF4444] text-white'
-                        : signal.severity === 'med'
+                        : signal.severity === 'medium'
                         ? 'bg-[#FBBF24] text-black'
                         : 'bg-[#93C5FD] text-black'
                     }`}
@@ -447,9 +583,24 @@ function StepSelection() {
                   </span>
                   <div>
                     <p className="font-medium text-[#F87171]">{signal.title}</p>
-                    <p className="text-xs text-[#9CA3AF] mt-1">{signal.reason}</p>
+                    <p className="text-xs text-[#9CA3AF] mt-1">{signal.description}</p>
                   </div>
                 </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Suggested Stories */}
+      {suggestedStories.length > 0 && (
+        <div className="mt-6 p-4 rounded-md border border-[#1F3B2F] bg-[#15261E]">
+          <p className="text-sm font-medium text-[#34D399] mb-4">Suggested Stories</p>
+          <div className="space-y-3">
+            {suggestedStories.map((story, index) => (
+              <div key={`${story.title}-${index}`} className="rounded-md border border-[#2B4A3B] bg-[#13211B] p-3">
+                <p className="text-sm font-medium text-[#E5E7EB]">{story.title}</p>
+                <p className="text-xs text-[#9CA3AF] mt-1">{story.summary}</p>
               </div>
             ))}
           </div>
@@ -463,8 +614,10 @@ function StepRefinement() {
   const {
     activeProject,
     generateQuestionsForStoryAction,
+    isGeneratingRefinementQuestionsForStoryId,
     updateQuestionAnswer,
     analyzeAnswers,
+    isAnalyzingRefinementAnswers,
   } = useScope();
 
   if (!activeProject) {
@@ -508,10 +661,15 @@ function StepRefinement() {
                     </div>
                     {questions.length === 0 ? (
                       <button
-                        onClick={() => generateQuestionsForStoryAction(story.id)}
-                        className="px-3 py-2 text-sm font-medium rounded-md bg-[#3F46E1] text-white border border-[#3F46E1] hover:bg-[#4F51E1] focus:outline-none focus:ring-1 focus:ring-[#3F46E1] transition-colors"
+                        onClick={() => void generateQuestionsForStoryAction(story.id)}
+                        disabled={isGeneratingRefinementQuestionsForStoryId !== null}
+                        className={`px-3 py-2 text-sm font-medium rounded-md border transition-colors ${
+                          isGeneratingRefinementQuestionsForStoryId !== null
+                            ? 'bg-[#1C212B] text-[#6B7280] border-[#262C36] cursor-not-allowed'
+                            : 'bg-[#3F46E1] text-white border-[#3F46E1] hover:bg-[#4F51E1] focus:outline-none focus:ring-1 focus:ring-[#3F46E1]'
+                        }`}
                       >
-                        Generate Questions
+                        {isGeneratingRefinementQuestionsForStoryId === story.id ? 'Generating...' : 'Generate Questions'}
                       </button>
                     ) : (
                       <span className="px-3 py-2 text-sm text-[#10B981] bg-[#064E3B] rounded">
@@ -557,10 +715,15 @@ function StepRefinement() {
           {/* Analyze Answers Button */}
           {canAnalyze && (
             <button
-              onClick={analyzeAnswers}
-              className="px-6 py-3 mb-8 text-sm font-medium rounded-md bg-[#10B981] text-white border border-[#10B981] hover:bg-[#059669] focus:outline-none focus:ring-1 focus:ring-[#10B981] transition-colors"
+              onClick={() => void analyzeAnswers()}
+              disabled={isAnalyzingRefinementAnswers}
+              className={`px-6 py-3 mb-8 text-sm font-medium rounded-md border transition-colors ${
+                isAnalyzingRefinementAnswers
+                  ? 'bg-[#1C212B] text-[#6B7280] border-[#262C36] cursor-not-allowed'
+                  : 'bg-[#10B981] text-white border-[#10B981] hover:bg-[#059669] focus:outline-none focus:ring-1 focus:ring-[#10B981]'
+              }`}
             >
-              Analyze Answers
+              {isAnalyzingRefinementAnswers ? 'Analyzing...' : 'Analyze Answers'}
             </button>
           )}
         </>
@@ -570,10 +733,179 @@ function StepRefinement() {
 }
 
 function StepOutput() {
+  const { activeProject, generateFinalOutput, isGeneratingFinalOutput } = useScope();
+
+  if (!activeProject) {
+    return <div className="text-[#9CA3AF]">Loading project...</div>;
+  }
+
+  const { storyCandidates, customStories, selectedStoryIds, refinedOutputByStoryId, finalOutputByStoryId } = activeProject;
+  const allStories = [...storyCandidates, ...customStories];
+  const selectedRefinedStories = allStories
+    .filter((story) => selectedStoryIds.includes(story.id))
+    .map((story) => ({
+      storyId: story.id,
+      storyTitle: story.title,
+      refinedOutput: refinedOutputByStoryId[story.id],
+    }))
+    .filter((entry) => Boolean(entry.refinedOutput));
+
+  const finalOutputs = selectedRefinedStories
+    .map((entry) => ({
+      storyId: entry.storyId,
+      storyTitle: entry.storyTitle,
+      output: finalOutputByStoryId[entry.storyId],
+    }))
+    .filter((entry) => Boolean(entry.output));
+
+  const hasPendingFinalOutputs = selectedRefinedStories.length > finalOutputs.length;
+
   return (
     <div>
       <h2 className="text-xl font-semibold text-[#E5E7EB] mb-2">Output</h2>
-      <p className="text-[#9CA3AF]">Generate final scope output and deliverables.</p>
+      <p className="text-[#9CA3AF] mb-8">Generate final structured output from the refined stories.</p>
+
+      {selectedRefinedStories.length === 0 ? (
+        <div className="p-6 rounded-md border border-[#262C36] bg-[#1C212B]">
+          <p className="text-[#9CA3AF]">
+            No refined stories found yet. Complete Step 4 and analyze answers before generating final output.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="mb-6 p-4 rounded-md border border-[#262C36] bg-[#1C212B]">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium text-[#E5E7EB]">Final Output Generator</p>
+                <p className="text-xs text-[#9CA3AF] mt-1">
+                  Generate product-ready output for {selectedRefinedStories.length} refined{' '}
+                  {selectedRefinedStories.length === 1 ? 'story' : 'stories'}.
+                </p>
+              </div>
+              <button
+                onClick={() => void generateFinalOutput()}
+                disabled={isGeneratingFinalOutput}
+                className={`px-4 py-2 text-sm font-medium rounded-md border transition-colors ${
+                  isGeneratingFinalOutput
+                    ? 'bg-[#1C212B] text-[#6B7280] border-[#262C36] cursor-not-allowed'
+                    : 'bg-[#3F46E1] text-white border-[#3F46E1] hover:bg-[#4F51E1] focus:outline-none focus:ring-1 focus:ring-[#3F46E1]'
+                }`}
+              >
+                {isGeneratingFinalOutput ? 'Generating Final Output...' : 'Generate Final Output'}
+              </button>
+            </div>
+          </div>
+
+          {finalOutputs.length === 0 ? (
+            <div className="p-6 rounded-md border border-[#262C36] bg-[#1C212B]">
+              <p className="text-[#9CA3AF] text-sm">
+                Final output has not been generated yet. Click Generate Final Output to build the structured stories.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {finalOutputs.map((entry) => {
+                const output = entry.output;
+                if (!output) return null;
+
+                return (
+                  <div key={entry.storyId} className="p-6 rounded-md border border-[#262C36] bg-[#1C212B]">
+                    <p className="text-sm font-semibold text-[#E5E7EB] mb-3">{output.storyTitle || entry.storyTitle}</p>
+
+                    <div className="p-3 rounded-md border border-[#2A303B] bg-[#0F1115] mb-4">
+                      <p className="text-xs uppercase tracking-wide text-[#6B7280] mb-1">User Story Statement</p>
+                      <p className="text-sm text-[#E5E7EB]">{output.userStoryStatement || 'No statement generated.'}</p>
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div className="p-3 rounded-md border border-[#2A303B] bg-[#0F1115]">
+                        <p className="text-xs uppercase tracking-wide text-[#6B7280] mb-2">Acceptance Criteria</p>
+                        {output.acceptanceCriteria.length > 0 ? (
+                          <ul className="list-disc list-inside space-y-1">
+                            {output.acceptanceCriteria.map((item, index) => (
+                              <li key={`${entry.storyId}-ac-${index}`} className="text-sm text-[#E5E7EB]">
+                                {item}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-xs text-[#6B7280]">None provided.</p>
+                        )}
+                      </div>
+
+                      <div className="p-3 rounded-md border border-[#2A303B] bg-[#0F1115]">
+                        <p className="text-xs uppercase tracking-wide text-[#6B7280] mb-2">Technical Notes</p>
+                        {output.technicalNotes.length > 0 ? (
+                          <ul className="list-disc list-inside space-y-1">
+                            {output.technicalNotes.map((item, index) => (
+                              <li key={`${entry.storyId}-tn-${index}`} className="text-sm text-[#E5E7EB]">
+                                {item}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-xs text-[#6B7280]">None provided.</p>
+                        )}
+                      </div>
+
+                      <div className="p-3 rounded-md border border-[#2A303B] bg-[#0F1115]">
+                        <p className="text-xs uppercase tracking-wide text-[#6B7280] mb-2">Not Included</p>
+                        {output.notIncluded.length > 0 ? (
+                          <ul className="list-disc list-inside space-y-1">
+                            {output.notIncluded.map((item, index) => (
+                              <li key={`${entry.storyId}-ni-${index}`} className="text-sm text-[#E5E7EB]">
+                                {item}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-xs text-[#6B7280]">None provided.</p>
+                        )}
+                      </div>
+
+                      <div className="p-3 rounded-md border border-[#2A303B] bg-[#0F1115]">
+                        <p className="text-xs uppercase tracking-wide text-[#6B7280] mb-2">Assumptions</p>
+                        {output.assumptions.length > 0 ? (
+                          <ul className="list-disc list-inside space-y-1">
+                            {output.assumptions.map((item, index) => (
+                              <li key={`${entry.storyId}-as-${index}`} className="text-sm text-[#E5E7EB]">
+                                {item}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p className="text-xs text-[#6B7280]">None provided.</p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="mt-4 p-3 rounded-md border border-[#4A3A19] bg-[#2A2315]">
+                      <p className="text-xs uppercase tracking-wide text-[#D1A245] mb-2">Open Questions</p>
+                      {output.openQuestions.length > 0 ? (
+                        <ul className="list-disc list-inside space-y-1">
+                          {output.openQuestions.map((item, index) => (
+                            <li key={`${entry.storyId}-oq-${index}`} className="text-sm text-[#E5E7EB]">
+                              {item}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="text-xs text-[#9CA3AF]">None. No unresolved items detected.</p>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {hasPendingFinalOutputs && !isGeneratingFinalOutput && (
+            <p className="text-xs text-[#9CA3AF] mt-4">
+              Some stories were updated after the last run. Generate again to refresh all outputs.
+            </p>
+          )}
+        </>
+      )}
     </div>
   );
 }

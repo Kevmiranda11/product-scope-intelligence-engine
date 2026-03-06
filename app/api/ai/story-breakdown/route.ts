@@ -25,10 +25,19 @@ export async function POST(request: NextRequest) {
       schemaName: 'story_breakdown_response',
       schema: storyBreakdownResponseSchema,
       systemPrompt:
-        'Generate candidate user stories for a product scope workspace. Keep output concise and schema-compliant.',
+        [
+          'You are helping with Step 2 (Story Breakdown) of a product scope workflow.',
+          'Return exactly 5 to 10 candidate user stories in strict JSON schema format.',
+          'Primary source of truth is contextBrief.',
+          'projectName and scopeName provide naming context.',
+          'sprintDuration and teamComposition are soft context only; do not treat them as hard constraints.',
+          'Generate concise, product-oriented candidates that can be selected, refined, or discarded later.',
+          'Each candidate needs a clear title and a short summary.',
+          'Do not add markdown or prose outside schema output.',
+        ].join(' '),
       userPayload: {
-        task: 'step_2_story_breakdown_placeholder',
-        projectContext: body,
+        task: 'step_2_story_breakdown',
+        input: body,
       },
     });
 

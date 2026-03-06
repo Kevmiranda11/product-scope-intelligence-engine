@@ -1,17 +1,22 @@
 'use client';
 
-import React, { createContext, useContext, useState, useMemo, useEffect, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useMemo, useEffect, useRef, ReactNode } from 'react';
 
 interface StoryCandidate {
   id: string;
   title: string;
+  summary?: string;
 }
 
 interface MissingScopeSignal {
-  id: string;
   title: string;
-  reason: string;
-  severity: 'low' | 'med' | 'high';
+  severity: 'low' | 'medium' | 'high';
+  description: string;
+}
+
+interface SuggestedStory {
+  title: string;
+  summary: string;
 }
 
 interface RefinementQuestion {
@@ -28,6 +33,7 @@ interface RefinedOutput {
   technicalNotes: string[];
   notIncluded: string[];
   assumptions: string[];
+  openQuestions: string[];
 }
 
 interface Project {
@@ -46,8 +52,12 @@ interface Project {
   customStories: StoryCandidate[];
   scopeConfidence: number;
   missingScopeSignals: MissingScopeSignal[];
+  suggestedStories: SuggestedStory[];
+  scopeScoreExplanation: string | null;
+  lastSelectionAnalysisStateKey: string | null;
   refinementQuestionsByStoryId: Record<string, RefinementQuestion[]>;
   refinedOutputByStoryId: Record<string, RefinedOutput>;
+  finalOutputByStoryId: Record<string, RefinedOutput>;
   ownerId?: string;
   isDeleted?: boolean;
   deletedAt?: string | null;
@@ -84,7 +94,12 @@ interface ScopeContextType {
   setActiveStep: (stepIndex: number) => void;
   
   // Story generation
-  generateStoryCandidates: () => void;
+  generateStoryCandidates: () => Promise<void>;
+  isGeneratingStoryCandidates: boolean;
+  analyzeSelectionCoverage: () => Promise<void>;
+  isAnalyzingSelectionCoverage: boolean;
+  generateScopeScoreExplanation: () => Promise<void>;
+  isGeneratingScopeScoreExplanation: boolean;
   
   // Story selection and custom stories
   toggleStorySelection: (storyId: string) => void;
@@ -92,9 +107,13 @@ interface ScopeContextType {
   removeCustomStory: (storyId: string) => void;
   
   // Refinement
-  generateQuestionsForStoryAction: (storyId: string) => void;
+  generateQuestionsForStoryAction: (storyId: string) => Promise<void>;
+  isGeneratingRefinementQuestionsForStoryId: string | null;
   updateQuestionAnswer: (storyId: string, questionId: string, answer: string) => void;
-  analyzeAnswers: () => void;
+  analyzeAnswers: () => Promise<void>;
+  isAnalyzingRefinementAnswers: boolean;
+  generateFinalOutput: () => Promise<void>;
+  isGeneratingFinalOutput: boolean;
   
   // Project management
   createProject: (name: string) => void;
@@ -132,9 +151,8 @@ function computeMissingScopeSignals(contextBrief: string): { signals: MissingSco
 
   if (!contextBrief || contextBrief.trim().length < 30) {
     signals.push({
-      id: generateUUID(),
       title: 'Inadequate Context Provided',
-      reason: 'Context brief is very short. More details needed for accurate story generation.',
+      description: 'Context brief is very short. More details needed for accurate story generation.',
       severity: 'high',
     });
   }
@@ -143,10 +161,9 @@ function computeMissingScopeSignals(contextBrief: string): { signals: MissingSco
   const hasErrorHandling = errorKeywords.some((kw) => briefLower.includes(kw));
   if (!hasErrorHandling) {
     signals.push({
-      id: generateUUID(),
       title: 'Error Handling & Messages',
-      reason: 'Context brief does not mention error handling or validation messages.',
-      severity: 'med',
+      description: 'Context brief does not mention error handling or validation messages.',
+      severity: 'medium',
     });
   }
 
@@ -154,9 +171,8 @@ function computeMissingScopeSignals(contextBrief: string): { signals: MissingSco
   const hasPermissions = permKeywords.some((kw) => briefLower.includes(kw));
   if (!hasPermissions) {
     signals.push({
-      id: generateUUID(),
       title: 'Permissions & Access Control',
-      reason: 'No mention of roles, permissions, or access control.',
+      description: 'No mention of roles, permissions, or access control.',
       severity: 'low',
     });
   }
@@ -165,7 +181,7 @@ function computeMissingScopeSignals(contextBrief: string): { signals: MissingSco
   let confidence = 100;
   signals.forEach((signal) => {
     if (signal.severity === 'high') confidence -= 25;
-    else if (signal.severity === 'med') confidence -= 15;
+    else if (signal.severity === 'medium') confidence -= 15;
     else if (signal.severity === 'low') confidence -= 8;
   });
   confidence = Math.max(0, Math.min(100, confidence));
@@ -173,148 +189,115 @@ function computeMissingScopeSignals(contextBrief: string): { signals: MissingSco
   return { signals, confidence };
 }
 
-function generateStoryCandidatesForProject(contextBrief: string): StoryCandidate[] {
-  // Keywords to extract from context brief for story themes
-  const keywords = [
-    { word: 'auth', stories: ['Set up user authentication', 'Implement password reset', 'Add two-factor authentication'] },
-    { word: 'user', stories: ['Create user profile page', 'Implement user preferences', 'Add user dashboard'] },
-    { word: 'data', stories: ['Design data schema', 'Build data export', 'Create data validation', 'Implement data sync'] },
-    { word: 'search', stories: ['Implement search functionality', 'Add search filters', 'Optimize search performance'] },
-    { word: 'api', stories: ['Design REST endpoints', 'Implement API documentation', 'Add API rate limiting', 'Create API clients'] },
-    { word: 'payment', stories: ['Integrate payment system', 'Implement checkout flow', 'Add payment validation'] },
-    { word: 'notification', stories: ['Add email notifications', 'Implement push notifications', 'Create notification preferences'] },
-    { word: 'mobile', stories: ['Design mobile UI', 'Implement responsive design', 'Add mobile optimizations'] },
-    { word: 'report', stories: ['Create report generator', 'Add report scheduling', 'Implement report export'] },
-    { word: 'analytics', stories: ['Set up event tracking', 'Create analytics dashboard', 'Implement metrics reporting'] },
-  ];
+function normalizeMissingScopeSignals(
+  signals:
+    | Array<{ title?: string; description?: string; reason?: string; severity?: string }>
+    | undefined
+): MissingScopeSignal[] {
+  if (!signals) return [];
 
-  const briefLower = contextBrief.toLowerCase();
-  const matchedStories: string[] = [];
+  return signals.map((signal) => {
+    const normalizedSeverity =
+      signal.severity === 'high'
+        ? 'high'
+        : signal.severity === 'medium' || signal.severity === 'med'
+        ? 'medium'
+        : 'low';
 
-  // Find relevant stories based on keywords in the brief
-  keywords.forEach(({ word, stories }) => {
-    if (briefLower.includes(word)) {
-      matchedStories.push(...stories);
-    }
+    return {
+      title: signal.title ?? 'Untitled gap',
+      severity: normalizedSeverity,
+      description: signal.description ?? signal.reason ?? '',
+    };
   });
-
-  // If no matched stories, use generic ones
-  if (matchedStories.length === 0) {
-    matchedStories.push(
-      'Define core functionality',
-      'Set up project structure',
-      'Create initial documentation',
-      'Implement error handling',
-      'Add logging and monitoring',
-      'Set up testing framework'
-    );
-  }
-
-  // Shuffle and pick 6-8 unique stories
-  const count = Math.min(6 + Math.floor(Math.random() * 3), matchedStories.length);
-  const shuffled = [...matchedStories].sort(() => Math.random() - 0.5);
-  const unique = Array.from(new Set(shuffled));
-  
-  return unique.slice(0, count).map((title) => ({
-    id: generateUUID(),
-    title,
-  }));
 }
 
-function generateQuestionsForStory(storyTitle: string): RefinementQuestion[] {
-  const baseQuestions: Record<'Frontend' | 'Backend' | 'QA', string[]> = {
-    'Frontend': [
-      'What should happen when the user encounters an error?',
-      'How should empty states be displayed?',
-      'Which fields require validation feedback?',
-      'Should there be permission-based UI hiding?',
-      'What loading states need to be shown?',
-    ],
-    'Backend': [
-      'What data model/schema is required?',
-      'Which API endpoints are needed?',
-      'How should errors be handled and reported?',
-      'Are there rate limits or constraints?',
-      'What authentication/authorization checks are needed?',
-    ],
-    'QA': [
-      'What are the main happy paths?',
-      'What edge cases should be tested?',
-      'What happens with invalid inputs?',
-      'How should concurrent actions be handled?',
-      'What acceptance criteria must pass?',
-    ],
-  };
-
-  const questions: RefinementQuestion[] = [];
-  let id = 0;
-
-  (['Frontend', 'Backend', 'QA'] as const).forEach((role) => {
-    baseQuestions[role].forEach((question) => {
-      questions.push({
-        id: `${role}-${id++}`,
-        role,
-        question,
-        answer: '',
-      });
-    });
-  });
-
-  return questions;
+function clampScore(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
 }
 
-function synthesizeRefinedOutput(
-  storyTitle: string,
-  questions: RefinementQuestion[],
-  contextBrief: string
-): RefinedOutput {
-  // Build a simple refined output from questions and context
-  const userStoryStatement = `As a user, I want to ${storyTitle.toLowerCase()} so that I can achieve my goal efficiently.`;
+function buildSelectionAnalysisStateKey(
+  contextBrief: string,
+  selectedStories: Array<{ title: string; summary: string }>
+): string {
+  const normalizedStories = selectedStories
+    .map((story) => `${story.title.trim().toLowerCase()}::${story.summary.trim().toLowerCase()}`)
+    .sort()
+    .join('|');
+  return `${contextBrief.trim().toLowerCase()}::${normalizedStories}`;
+}
 
-  const acceptanceCriteria: string[] = [];
-  const techKeywords = ['api', 'endpoint', 'database', 'db', 'schema', 'request', 'response', 'jwt', 'token', 'sql'];
-  const technicalNotes: string[] = [];
-  const notIncluded: string[] = [];
-  const assumptions: string[] = [];
+function calculateDeterministicBaseScore(params: {
+  selectedCount: number;
+  generatedCandidateCount: number;
+  contextBrief: string;
+  missingAreas: MissingScopeSignal[];
+}): number {
+  const { selectedCount, generatedCandidateCount, contextBrief, missingAreas } = params;
 
-  questions.forEach((q) => {
-    if (!q.answer || q.answer.trim().length === 0) {
-      assumptions.push(`Clarify: ${q.question}`);
-      return;
-    }
-
-    const answer = q.answer.trim();
-
-    const isTechnical = techKeywords.some((kw) => answer.toLowerCase().includes(kw));
-    if (isTechnical) {
-      technicalNotes.push(`${q.role}: ${answer}`);
-    }
-
-    if (answer.toLowerCase().includes('out of scope') || answer.toLowerCase().includes('not included')) {
-      notIncluded.push(answer);
-    }
-
-    if (acceptanceCriteria.length < 8 && !isTechnical) {
-      acceptanceCriteria.push(`${answer.charAt(0).toUpperCase()}${answer.slice(1)}`);
-    }
-  });
-
-  if (acceptanceCriteria.length === 0) {
-    acceptanceCriteria.push(
-      'System successfully processes the user request',
-      'All validation checks pass',
-      'Error messages are clear and actionable'
-    );
+  if (selectedCount === 0) {
+    return 0;
   }
 
-  return {
-    storyTitle,
-    userStoryStatement,
-    acceptanceCriteria,
-    technicalNotes,
-    notIncluded,
-    assumptions,
-  };
+  let score = 35;
+  score += Math.min(selectedCount, 8) * 5;
+
+  if (generatedCandidateCount > 0) {
+    const selectionRatio = Math.min(selectedCount / generatedCandidateCount, 1);
+    score += selectionRatio * 20;
+  } else {
+    score += Math.min(selectedCount, 3) * 3;
+  }
+
+  const briefLength = contextBrief.trim().length;
+  if (briefLength < 30) score -= 25;
+  else if (briefLength < 80) score -= 12;
+  else if (briefLength < 140) score -= 6;
+
+  let missingAreaPenalty = 0;
+  missingAreas.forEach((area) => {
+    if (area.severity === 'high') missingAreaPenalty += 12;
+    else if (area.severity === 'medium') missingAreaPenalty += 7;
+    else missingAreaPenalty += 4;
+  });
+  score -= Math.min(missingAreaPenalty, 35);
+
+  if (missingAreas.length === 0) {
+    score += 5;
+  }
+
+  return clampScore(score);
+}
+
+function combineBaseWithAiAdjustment(baseScore: number, aiScopeConfidence: number | undefined): number {
+  if (typeof aiScopeConfidence !== 'number' || Number.isNaN(aiScopeConfidence)) {
+    return baseScore;
+  }
+
+  const clampedAiScore = clampScore(aiScopeConfidence);
+  const delta = clampedAiScore - baseScore;
+  const dampenedAdjustment = Math.max(-10, Math.min(10, delta * 0.35));
+  return clampScore(baseScore + dampenedAdjustment);
+}
+
+function normalizeRefinedOutputByStoryId(
+  outputs: Record<string, Partial<RefinedOutput>> | undefined
+): Record<string, RefinedOutput> {
+  if (!outputs) return {};
+
+  const normalized: Record<string, RefinedOutput> = {};
+  Object.entries(outputs).forEach(([storyId, output]) => {
+    normalized[storyId] = {
+      storyTitle: output.storyTitle ?? '',
+      userStoryStatement: output.userStoryStatement ?? '',
+      acceptanceCriteria: output.acceptanceCriteria ?? [],
+      technicalNotes: output.technicalNotes ?? [],
+      notIncluded: output.notIncluded ?? [],
+      assumptions: output.assumptions ?? [],
+      openQuestions: output.openQuestions ?? [],
+    };
+  });
+  return normalized;
 }
 
 function getDefaultProjects(): Project[] {
@@ -334,8 +317,12 @@ function getDefaultProjects(): Project[] {
       customStories: [],
       scopeConfidence: 100,
       missingScopeSignals: [],
+      suggestedStories: [],
+      scopeScoreExplanation: null,
+      lastSelectionAnalysisStateKey: null,
       refinementQuestionsByStoryId: {},
       refinedOutputByStoryId: {},
+      finalOutputByStoryId: {},
       ownerId: 'user-1',
       isDeleted: false,
       deletedAt: null,
@@ -356,8 +343,12 @@ function getDefaultProjects(): Project[] {
       customStories: [],
       scopeConfidence: 100,
       missingScopeSignals: [],
+      suggestedStories: [],
+      scopeScoreExplanation: null,
+      lastSelectionAnalysisStateKey: null,
       refinementQuestionsByStoryId: {},
       refinedOutputByStoryId: {},
+      finalOutputByStoryId: {},
       ownerId: 'user-2',
       isDeleted: false,
       deletedAt: null,
@@ -375,6 +366,14 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
   const [isHydrated, setIsHydrated] = useState(false);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isGeneratingStoryCandidates, setIsGeneratingStoryCandidates] = useState(false);
+  const [isAnalyzingSelectionCoverage, setIsAnalyzingSelectionCoverage] = useState(false);
+  const [isGeneratingScopeScoreExplanation, setIsGeneratingScopeScoreExplanation] = useState(false);
+  const [isGeneratingRefinementQuestionsForStoryId, setIsGeneratingRefinementQuestionsForStoryId] = useState<string | null>(null);
+  const [isAnalyzingRefinementAnswers, setIsAnalyzingRefinementAnswers] = useState(false);
+  const [isGeneratingFinalOutput, setIsGeneratingFinalOutput] = useState(false);
+  const latestSelectionAnalysisRequestIdRef = useRef(0);
+  const latestScoreExplanationRequestIdRef = useRef(0);
 
   // normalize a project object so required fields always exist
   function normalizeProject(p: Partial<Project>): Project {
@@ -392,9 +391,24 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
       selectedStoryIds: p.selectedStoryIds ?? [],
       customStories: p.customStories ?? [],
       scopeConfidence: p.scopeConfidence ?? 100,
-      missingScopeSignals: p.missingScopeSignals ?? [],
+      missingScopeSignals: normalizeMissingScopeSignals(
+        p.missingScopeSignals as
+          | Array<{ title?: string; description?: string; reason?: string; severity?: string }>
+          | undefined
+      ),
+      suggestedStories: (p.suggestedStories ?? []).map((story) => ({
+        title: story.title ?? '',
+        summary: story.summary ?? '',
+      })),
+      scopeScoreExplanation: p.scopeScoreExplanation ?? null,
+      lastSelectionAnalysisStateKey: p.lastSelectionAnalysisStateKey ?? null,
       refinementQuestionsByStoryId: p.refinementQuestionsByStoryId ?? {},
-      refinedOutputByStoryId: p.refinedOutputByStoryId ?? {},
+      refinedOutputByStoryId: normalizeRefinedOutputByStoryId(
+        p.refinedOutputByStoryId as Record<string, Partial<RefinedOutput>> | undefined
+      ),
+      finalOutputByStoryId: normalizeRefinedOutputByStoryId(
+        p.finalOutputByStoryId as Record<string, Partial<RefinedOutput>> | undefined
+      ),
       ownerId: p.ownerId,
       isDeleted: p.isDeleted ?? false,
       deletedAt: p.deletedAt ?? null,
@@ -512,8 +526,12 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
       customStories: [],
       scopeConfidence: 100,
       missingScopeSignals: [],
+      suggestedStories: [],
+      scopeScoreExplanation: null,
+      lastSelectionAnalysisStateKey: null,
       refinementQuestionsByStoryId: {},
       refinedOutputByStoryId: {},
+      finalOutputByStoryId: {},
       ownerId: typeof window !== 'undefined' ? localStorage.getItem('currentUserId') || undefined : undefined,
       isDeleted: false,
       deletedAt: null,
@@ -556,52 +574,349 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
     updateActiveProject({ activeStep: stepIndex });
   };
 
-  const generateStoryCandidates = () => {
+  const generateStoryCandidates = async () => {
     if (activeProject) {
-      const { contextBrief } = activeProject;
+      const { contextBrief, name, scopeName, sprintDuration, team } = activeProject;
       
       // Validate context brief length
       if (!contextBrief || contextBrief.trim().length < 30) {
         // Do not generate; let UI handle the validation message
         return;
       }
-      
-      const candidates = generateStoryCandidatesForProject(contextBrief);
-      const now = new Date().toLocaleString();
-      
-      // Auto-select all generated candidates
-      const selectedIds = candidates.map((c) => c.id);
-      
-      // Compute missing scope signals
-      const { signals, confidence } = computeMissingScopeSignals(contextBrief);
-      
-      updateActiveProject({
-        storyCandidates: candidates,
-        lastGeneratedAt: now,
-        selectedStoryIds: selectedIds,
-        scopeConfidence: confidence,
-        missingScopeSignals: signals,
+
+      if (isGeneratingStoryCandidates) {
+        return;
+      }
+
+      latestSelectionAnalysisRequestIdRef.current += 1;
+      latestScoreExplanationRequestIdRef.current += 1;
+      setIsGeneratingStoryCandidates(true);
+
+      try {
+        const response = await fetch('/api/ai/story-breakdown', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            projectName: name,
+            scopeName,
+            sprintDuration,
+            teamComposition: team,
+            contextBrief,
+          }),
+        });
+
+        if (!response.ok) {
+          let message = 'Failed to generate story candidates.';
+          try {
+            const errorBody = (await response.json()) as { error?: string };
+            if (errorBody.error) {
+              message = errorBody.error;
+            }
+          } catch {
+            // Keep default message for non-JSON responses
+          }
+          throw new Error(message);
+        }
+
+        const payload = (await response.json()) as {
+          storyCandidates: Array<{ id: string; title: string; summary: string }>;
+        };
+
+        const candidates = payload.storyCandidates
+          .filter((story) => story.id && story.title)
+          .map((story) => ({
+            id: story.id,
+            title: story.title.trim(),
+            summary: story.summary.trim(),
+          }));
+
+        const now = new Date().toLocaleString();
+
+        // Auto-select all generated candidates
+        const selectedIds = candidates.map((c) => c.id);
+
+        // Compute missing scope signals
+        const { signals, confidence } = computeMissingScopeSignals(contextBrief);
+
+        updateActiveProject({
+          storyCandidates: candidates,
+          lastGeneratedAt: now,
+          selectedStoryIds: selectedIds,
+          scopeConfidence: confidence,
+          missingScopeSignals: signals,
+          suggestedStories: [],
+          scopeScoreExplanation: null,
+          lastSelectionAnalysisStateKey: null,
+          finalOutputByStoryId: {},
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to generate story candidates.';
+        showToast(message);
+      } finally {
+        setIsGeneratingStoryCandidates(false);
+      }
+    }
+  };
+
+  const analyzeSelectionCoverage = async () => {
+    if (!activeProject) {
+      return;
+    }
+
+    const { name, scopeName, contextBrief, storyCandidates, customStories, selectedStoryIds } = activeProject;
+    const allStories = [...storyCandidates, ...customStories];
+    const normalizeText = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
+    const normalizedStoryCandidates = allStories
+      .map((story) => ({
+        title: normalizeText(story.title),
+        summary: normalizeText(story.summary ?? ''),
+      }))
+      .filter((story) => story.title.length > 0);
+    const normalizedSelectedStories = allStories
+      .filter((story) => selectedStoryIds.includes(story.id))
+      .map((story) => ({
+        title: normalizeText(story.title),
+        summary: normalizeText(story.summary ?? ''),
+      }))
+      .filter((story) => story.title.length > 0);
+    const analysisStateKey = buildSelectionAnalysisStateKey(contextBrief, normalizedSelectedStories);
+
+    if (normalizedSelectedStories.length === 0) {
+      latestSelectionAnalysisRequestIdRef.current += 1;
+      console.log('STEP_3_SELECTION_ANALYSIS_SKIP_NO_SELECTED_STORIES', {
+        projectId: activeProject.id,
+        selectedStoryIdsCount: selectedStoryIds.length,
       });
+      updateActiveProject({
+        scopeConfidence: 0,
+        missingScopeSignals: [],
+        suggestedStories: [],
+        scopeScoreExplanation: null,
+        lastSelectionAnalysisStateKey: analysisStateKey,
+      });
+      setIsAnalyzingSelectionCoverage(false);
+      return;
+    }
+
+    if (!contextBrief.trim()) {
+      return;
+    }
+
+    const requestId = latestSelectionAnalysisRequestIdRef.current + 1;
+    latestSelectionAnalysisRequestIdRef.current = requestId;
+
+    setIsAnalyzingSelectionCoverage(true);
+
+    try {
+      const requestBody = {
+        projectName: normalizeText(name),
+        scopeName: normalizeText(scopeName),
+        contextBrief: normalizeText(contextBrief),
+        storyCandidates: normalizedStoryCandidates,
+        selectedStories: normalizedSelectedStories,
+      };
+      console.log('STEP_3_SELECTION_ANALYSIS_PAYLOAD', requestBody);
+
+      const response = await fetch('/api/ai/selection-analysis', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!response.ok) {
+        let message = 'Failed to analyze selected stories.';
+        let validationDetails: unknown;
+        try {
+          const errorBody = (await response.json()) as {
+            error?: string;
+            message?: string;
+            validationDetails?: unknown;
+          };
+          if (errorBody.message) {
+            message = errorBody.message;
+          } else if (errorBody.error) {
+            message = errorBody.error;
+          }
+          validationDetails = errorBody.validationDetails;
+          if (validationDetails) {
+            console.error('STEP_3_SELECTION_ANALYSIS_VALIDATION_ERROR', validationDetails);
+          }
+        } catch {
+          // Keep default message for non-JSON responses
+        }
+        throw new Error(message);
+      }
+
+      if (requestId !== latestSelectionAnalysisRequestIdRef.current) {
+        return;
+      }
+
+      const payload = (await response.json()) as {
+        scopeConfidence: number;
+        missingAreas: Array<{
+          title: string;
+          severity: 'low' | 'medium' | 'high';
+          description: string;
+        }>;
+        suggestedStories: Array<{
+          title: string;
+          summary: string;
+        }>;
+      };
+
+      const normalizedMissingAreas = payload.missingAreas.map((area) => ({
+        title: area.title.trim(),
+        severity: area.severity,
+        description: area.description.trim(),
+      }));
+      const baseScore = calculateDeterministicBaseScore({
+        selectedCount: normalizedSelectedStories.length,
+        generatedCandidateCount: storyCandidates.length,
+        contextBrief,
+        missingAreas: normalizedMissingAreas,
+      });
+      const finalScore = combineBaseWithAiAdjustment(baseScore, payload.scopeConfidence);
+
+      updateActiveProject({
+        scopeConfidence: finalScore,
+        missingScopeSignals: normalizedMissingAreas,
+        suggestedStories: payload.suggestedStories.map((story) => ({
+          title: story.title.trim(),
+          summary: story.summary.trim(),
+        })),
+        scopeScoreExplanation: null,
+        lastSelectionAnalysisStateKey: analysisStateKey,
+      });
+    } catch (error) {
+      if (requestId !== latestSelectionAnalysisRequestIdRef.current) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : 'Failed to analyze selected stories.';
+      showToast(message);
+    } finally {
+      if (requestId === latestSelectionAnalysisRequestIdRef.current) {
+        setIsAnalyzingSelectionCoverage(false);
+      }
+    }
+  };
+
+  const generateScopeScoreExplanation = async () => {
+    if (!activeProject || isGeneratingScopeScoreExplanation) {
+      return;
+    }
+
+    const { name, scopeName, contextBrief, storyCandidates, customStories, selectedStoryIds, scopeConfidence, missingScopeSignals, suggestedStories } =
+      activeProject;
+    const allStories = [...storyCandidates, ...customStories];
+    const normalizeText = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
+    const selectedStories = allStories
+      .filter((story) => selectedStoryIds.includes(story.id))
+      .map((story) => ({
+        title: normalizeText(story.title),
+        summary: normalizeText(story.summary ?? ''),
+      }))
+      .filter((story) => story.title.length > 0);
+
+    if (selectedStories.length === 0) {
+      return;
+    }
+
+    const requestId = latestScoreExplanationRequestIdRef.current + 1;
+    latestScoreExplanationRequestIdRef.current = requestId;
+    setIsGeneratingScopeScoreExplanation(true);
+
+    try {
+      const response = await fetch('/api/ai/selection-score-explanation', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          projectName: normalizeText(name),
+          scopeName: normalizeText(scopeName),
+          contextBrief: normalizeText(contextBrief),
+          selectedStories,
+          scopeConfidence,
+          missingAreas: missingScopeSignals.map((area) => ({
+            title: area.title,
+            severity: area.severity,
+            description: area.description,
+          })),
+          suggestedStories: suggestedStories.map((story) => ({
+            title: normalizeText(story.title),
+            summary: normalizeText(story.summary),
+          })),
+        }),
+      });
+
+      if (!response.ok) {
+        let message = 'Failed to generate score explanation.';
+        try {
+          const errorBody = (await response.json()) as { error?: string };
+          if (errorBody.error) {
+            message = errorBody.error;
+          }
+        } catch {
+          // Keep default message for non-JSON responses
+        }
+        throw new Error(message);
+      }
+
+      if (requestId !== latestScoreExplanationRequestIdRef.current) {
+        return;
+      }
+
+      const payload = (await response.json()) as { explanation: string };
+      updateActiveProject({
+        scopeScoreExplanation: payload.explanation.trim(),
+      });
+    } catch (error) {
+      if (requestId !== latestScoreExplanationRequestIdRef.current) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : 'Failed to generate score explanation.';
+      showToast(message);
+    } finally {
+      if (requestId === latestScoreExplanationRequestIdRef.current) {
+        setIsGeneratingScopeScoreExplanation(false);
+      }
     }
   };
 
   const toggleStorySelection = (storyId: string) => {
     if (activeProject) {
+      latestSelectionAnalysisRequestIdRef.current += 1;
+      latestScoreExplanationRequestIdRef.current += 1;
       const { selectedStoryIds } = activeProject;
       const updated = selectedStoryIds.includes(storyId)
         ? selectedStoryIds.filter((id) => id !== storyId)
         : [...selectedStoryIds, storyId];
-      updateActiveProject({ selectedStoryIds: updated, isDirty: true });
+      updateActiveProject({
+        selectedStoryIds: updated,
+        scopeScoreExplanation: null,
+        lastSelectionAnalysisStateKey: null,
+        finalOutputByStoryId: {},
+        isDirty: true,
+      });
     }
   };
 
   const addCustomStory = (title: string) => {
     if (activeProject && title.trim()) {
+      latestSelectionAnalysisRequestIdRef.current += 1;
+      latestScoreExplanationRequestIdRef.current += 1;
       const newStory = { id: generateUUID(), title: title.trim() };
       const { customStories, selectedStoryIds } = activeProject;
       updateActiveProject({
         customStories: [...customStories, newStory],
         selectedStoryIds: [...selectedStoryIds, newStory.id],
+        scopeScoreExplanation: null,
+        lastSelectionAnalysisStateKey: null,
+        finalOutputByStoryId: {},
         isDirty: true,
       });
     }
@@ -609,31 +924,113 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
 
   const removeCustomStory = (storyId: string) => {
     if (activeProject) {
+      latestSelectionAnalysisRequestIdRef.current += 1;
+      latestScoreExplanationRequestIdRef.current += 1;
       const { customStories, selectedStoryIds } = activeProject;
       updateActiveProject({
         customStories: customStories.filter((s) => s.id !== storyId),
         selectedStoryIds: selectedStoryIds.filter((id) => id !== storyId),
+        scopeScoreExplanation: null,
+        lastSelectionAnalysisStateKey: null,
+        finalOutputByStoryId: {},
         isDirty: true,
       });
     }
   };
 
-  const generateQuestionsForStoryAction = (storyId: string) => {
-    if (activeProject) {
-      const { storyCandidates, customStories } = activeProject;
-      const allStories = [...storyCandidates, ...customStories];
-      const story = allStories.find((s) => s.id === storyId);
-      
-      if (story) {
-        const questions = generateQuestionsForStory(story.title);
-        const { refinementQuestionsByStoryId } = activeProject;
-        updateActiveProject({
-          refinementQuestionsByStoryId: {
-            ...refinementQuestionsByStoryId,
-            [storyId]: questions,
+  const generateQuestionsForStoryAction = async (storyId: string) => {
+    if (!activeProject || isGeneratingRefinementQuestionsForStoryId) {
+      return;
+    }
+
+    const { name, scopeName, contextBrief, storyCandidates, customStories, selectedStoryIds, refinementQuestionsByStoryId } =
+      activeProject;
+    const allStories = [...storyCandidates, ...customStories];
+    const story = allStories.find((s) => s.id === storyId);
+
+    if (!story) {
+      return;
+    }
+
+    const selectedStories = allStories
+      .filter((s) => selectedStoryIds.includes(s.id))
+      .map((s) => ({
+        title: s.title.trim(),
+        summary: (s.summary ?? '').trim(),
+      }));
+
+    setIsGeneratingRefinementQuestionsForStoryId(storyId);
+
+    try {
+      const response = await fetch('/api/ai/refinement-questions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          projectName: name,
+          scopeName,
+          contextBrief,
+          selectedStory: {
+            title: story.title.trim(),
+            summary: (story.summary ?? '').trim(),
           },
-        });
+          selectedStories,
+        }),
+      });
+
+      if (!response.ok) {
+        let message = 'Failed to generate refinement questions.';
+        try {
+          const errorBody = (await response.json()) as { error?: string };
+          if (errorBody.error) {
+            message = errorBody.error;
+          }
+        } catch {
+          // Keep default message for non-JSON responses.
+        }
+        throw new Error(message);
       }
+
+      const payload = (await response.json()) as {
+        frontendQuestions: string[];
+        backendQuestions: string[];
+        qaQuestions: string[];
+      };
+
+      const questions: RefinementQuestion[] = [
+        ...payload.frontendQuestions.map((question, index) => ({
+          id: `frontend-${index}`,
+          role: 'Frontend' as const,
+          question: question.trim(),
+          answer: '',
+        })),
+        ...payload.backendQuestions.map((question, index) => ({
+          id: `backend-${index}`,
+          role: 'Backend' as const,
+          question: question.trim(),
+          answer: '',
+        })),
+        ...payload.qaQuestions.map((question, index) => ({
+          id: `qa-${index}`,
+          role: 'QA' as const,
+          question: question.trim(),
+          answer: '',
+        })),
+      ].filter((q) => q.question.length > 0);
+
+      updateActiveProject({
+        refinementQuestionsByStoryId: {
+          ...refinementQuestionsByStoryId,
+          [storyId]: questions,
+        },
+        finalOutputByStoryId: {},
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to generate refinement questions.';
+      showToast(message);
+    } finally {
+      setIsGeneratingRefinementQuestionsForStoryId(null);
     }
   };
 
@@ -649,32 +1046,191 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
           ...refinementQuestionsByStoryId,
           [storyId]: updated,
         },
+        finalOutputByStoryId: {},
         isDirty: true,
       });
     }
   };
 
-  const analyzeAnswers = () => {
-    if (activeProject) {
-      const { refinementQuestionsByStoryId, storyCandidates, customStories, contextBrief } = activeProject;
-      const allStories = [...storyCandidates, ...customStories];
-      const refinedOutputByStoryId: Record<string, RefinedOutput> = {};
+  const analyzeAnswers = async () => {
+    if (!activeProject || isAnalyzingRefinementAnswers) {
+      return;
+    }
 
-      allStories.forEach((story) => {
-        if (refinementQuestionsByStoryId[story.id]) {
-          const questions = refinementQuestionsByStoryId[story.id];
-          refinedOutputByStoryId[story.id] = synthesizeRefinedOutput(
-            story.title,
-            questions,
-            contextBrief
-          );
+    const { name, scopeName, contextBrief, refinementQuestionsByStoryId, storyCandidates, customStories, selectedStoryIds } =
+      activeProject;
+    const allStories = [...storyCandidates, ...customStories];
+    const selectedStories = allStories.filter((story) => selectedStoryIds.includes(story.id));
+
+    if (selectedStories.length === 0) {
+      return;
+    }
+
+    setIsAnalyzingRefinementAnswers(true);
+
+    try {
+      const analysisResults = await Promise.all(
+        selectedStories.map(async (story) => {
+          const questions = refinementQuestionsByStoryId[story.id] ?? [];
+          if (questions.length === 0) {
+            return null;
+          }
+
+          const response = await fetch('/api/ai/refinement-analysis', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              projectName: name,
+              scopeName,
+              contextBrief,
+              selectedStory: {
+                title: story.title.trim(),
+                summary: (story.summary ?? '').trim(),
+              },
+              answeredQuestions: questions.map((question) => ({
+                role: question.role,
+                question: question.question,
+                answer: question.answer,
+              })),
+            }),
+          });
+
+          if (!response.ok) {
+            let message = `Failed to analyze refinement answers for "${story.title}".`;
+            try {
+              const errorBody = (await response.json()) as { error?: string };
+              if (errorBody.error) {
+                message = errorBody.error;
+              }
+            } catch {
+              // Keep default message for non-JSON responses.
+            }
+            throw new Error(message);
+          }
+
+          const payload = (await response.json()) as RefinedOutput;
+          return { storyId: story.id, output: payload };
+        })
+      );
+
+      const refinedOutputByStoryId: Record<string, RefinedOutput> = {};
+      analysisResults.forEach((result) => {
+        if (result) {
+          refinedOutputByStoryId[result.storyId] = result.output;
         }
       });
 
       updateActiveProject({
         refinedOutputByStoryId,
+        finalOutputByStoryId: {},
         isDirty: true,
       });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to analyze refinement answers.';
+      showToast(message);
+    } finally {
+      setIsAnalyzingRefinementAnswers(false);
+    }
+  };
+
+  const generateFinalOutput = async () => {
+    if (!activeProject || isGeneratingFinalOutput) {
+      return;
+    }
+
+    const { name, scopeName, contextBrief, storyCandidates, customStories, selectedStoryIds, refinedOutputByStoryId } =
+      activeProject;
+    const allStories = [...storyCandidates, ...customStories];
+    const normalizeText = (value: unknown) => (typeof value === 'string' ? value.trim() : '');
+    const normalizeList = (items: string[]) => items.map((item) => item.trim()).filter((item) => item.length > 0);
+
+    const refinedStories = allStories
+      .filter((story) => selectedStoryIds.includes(story.id))
+      .map((story) => ({
+        storyId: story.id,
+        storyTitle: normalizeText(story.title),
+        refinedOutput: refinedOutputByStoryId[story.id],
+      }))
+      .filter((entry) => Boolean(entry.refinedOutput));
+
+    if (refinedStories.length === 0) {
+      showToast('No refined stories found. Complete Step 4 first.');
+      return;
+    }
+
+    setIsGeneratingFinalOutput(true);
+
+    try {
+      const finalResults = await Promise.all(
+        refinedStories.map(async (entry) => {
+          const refinedOutput = entry.refinedOutput as RefinedOutput;
+          const payload = {
+            projectName: normalizeText(name),
+            scopeName: normalizeText(scopeName),
+            contextBrief: normalizeText(contextBrief),
+            storyTitle: normalizeText(refinedOutput.storyTitle || entry.storyTitle),
+            ...(normalizeText(refinedOutput.userStoryStatement)
+              ? { userStoryStatement: normalizeText(refinedOutput.userStoryStatement) }
+              : {}),
+            acceptanceCriteriaDraft: normalizeList(refinedOutput.acceptanceCriteria),
+            technicalNotes: normalizeList(refinedOutput.technicalNotes),
+            notIncluded: normalizeList(refinedOutput.notIncluded),
+            assumptions: normalizeList(refinedOutput.assumptions),
+            openQuestions: normalizeList(refinedOutput.openQuestions),
+          };
+
+          const response = await fetch('/api/ai/final-output', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+          });
+
+          if (!response.ok) {
+            let message = `Failed to generate final output for "${entry.storyTitle}".`;
+            try {
+              const errorBody = (await response.json()) as { error?: string };
+              if (errorBody.error) {
+                message = errorBody.error;
+              }
+            } catch {
+              // Keep default message for non-JSON responses.
+            }
+            throw new Error(message);
+          }
+
+          const result = (await response.json()) as RefinedOutput;
+          const output: RefinedOutput = {
+            storyTitle: normalizeText(result.storyTitle),
+            userStoryStatement: normalizeText(result.userStoryStatement),
+            acceptanceCriteria: normalizeList(result.acceptanceCriteria ?? []),
+            technicalNotes: normalizeList(result.technicalNotes ?? []),
+            notIncluded: normalizeList(result.notIncluded ?? []),
+            assumptions: normalizeList(result.assumptions ?? []),
+            openQuestions: normalizeList(result.openQuestions ?? []),
+          };
+
+          return { storyId: entry.storyId, output };
+        })
+      );
+
+      const finalOutputByStoryId: Record<string, RefinedOutput> = {};
+      finalResults.forEach((result) => {
+        finalOutputByStoryId[result.storyId] = result.output;
+      });
+
+      updateActiveProject({
+        finalOutputByStoryId,
+        isDirty: true,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to generate final output.';
+      showToast(message);
+    } finally {
+      setIsGeneratingFinalOutput(false);
     }
   };
 
@@ -700,12 +1256,21 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
     clearDirty,
     setActiveStep,
     generateStoryCandidates,
+    isGeneratingStoryCandidates,
+    analyzeSelectionCoverage,
+    isAnalyzingSelectionCoverage,
+    generateScopeScoreExplanation,
+    isGeneratingScopeScoreExplanation,
     toggleStorySelection,
     addCustomStory,
     removeCustomStory,
     generateQuestionsForStoryAction,
+    isGeneratingRefinementQuestionsForStoryId,
     updateQuestionAnswer,
     analyzeAnswers,
+    isAnalyzingRefinementAnswers,
+    generateFinalOutput,
+    isGeneratingFinalOutput,
     createProject,
     setActiveProject,
     renameProject,
