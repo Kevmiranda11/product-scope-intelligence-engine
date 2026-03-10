@@ -300,69 +300,14 @@ function normalizeRefinedOutputByStoryId(
   return normalized;
 }
 
-function getDefaultProjects(): Project[] {
-  return [
-    {
-      id: 'proj-1',
-      name: 'Mobile App MVP',
-      scopeName: 'Mobile App MVP',
-      sprintDuration: '2 weeks',
-      team: '3 engineers, 1 designer',
-      contextBrief: '',
-      version: 1,
-      isDirty: false,
-      activeStep: 0,
-      storyCandidates: [],
-      selectedStoryIds: [],
-      customStories: [],
-      scopeConfidence: 100,
-      missingScopeSignals: [],
-      suggestedStories: [],
-      scopeScoreExplanation: null,
-      lastSelectionAnalysisStateKey: null,
-      refinementQuestionsByStoryId: {},
-      refinedOutputByStoryId: {},
-      finalOutputByStoryId: {},
-      ownerId: 'user-1',
-      isDeleted: false,
-      deletedAt: null,
-      deletedBy: null,
-    },
-    {
-      id: 'proj-2',
-      name: 'Backend API v2',
-      scopeName: 'Backend API v2',
-      sprintDuration: '3 weeks',
-      team: '2 engineers, 1 DevOps',
-      contextBrief: '',
-      version: 1,
-      isDirty: false,
-      activeStep: 0,
-      storyCandidates: [],
-      selectedStoryIds: [],
-      customStories: [],
-      scopeConfidence: 100,
-      missingScopeSignals: [],
-      suggestedStories: [],
-      scopeScoreExplanation: null,
-      lastSelectionAnalysisStateKey: null,
-      refinementQuestionsByStoryId: {},
-      refinedOutputByStoryId: {},
-      finalOutputByStoryId: {},
-      ownerId: 'user-2',
-      isDeleted: false,
-      deletedAt: null,
-      deletedBy: null,
-    },
-  ];
-}
-
-const STORAGE_KEY = 'psi_workspace_v1';
+const CACHE_STORAGE_KEY = 'psi_workspace_cache_v2';
+const LEGACY_STORAGE_KEY = 'psi_workspace_v1';
+const ACTIVE_PROJECT_STORAGE_KEY = 'psi_active_project_v2';
+const LEGACY_IMPORT_MARKER_PREFIX = 'psi_legacy_imported_v1_';
 
 export function ScopeProvider({ children }: ScopeProviderProps) {
-  const defaultProjects = getDefaultProjects();
-  const [projects, setProjects] = useState<Project[]>(defaultProjects);
-  const [activeProjectId, setActiveProjectId] = useState<string>('proj-1');
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [activeProjectId, setActiveProjectId] = useState<string>('');
   const [isHydrated, setIsHydrated] = useState(false);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -374,6 +319,8 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
   const [isGeneratingFinalOutput, setIsGeneratingFinalOutput] = useState(false);
   const latestSelectionAnalysisRequestIdRef = useRef(0);
   const latestScoreExplanationRequestIdRef = useRef(0);
+  const bootstrappedRef = useRef(false);
+  const saveTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
   // normalize a project object so required fields always exist
   function normalizeProject(p: Partial<Project>): Project {
@@ -416,39 +363,165 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
     };
   }
 
-  // Load from localStorage on mount
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3000);
+  };
+
+  const loadProjectsFromServer = async () => {
+    try {
+      const response = await fetch('/api/projects', { cache: 'no-store' });
+      if (!response.ok) {
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Failed to load projects.');
+      }
+      const payload = (await response.json()) as { projects?: Partial<Project>[] };
+      const visible = (payload.projects || []).map(normalizeProject).filter((p) => !p.isDeleted);
+      setProjects(visible);
+      setActiveProjectId((prevId) => {
+        if (prevId && visible.some((p) => p.id === prevId)) return prevId;
+        const remembered = typeof window !== 'undefined' ? localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY) : null;
+        if (remembered && visible.some((p) => p.id === remembered)) return remembered;
+        return visible[0]?.id || '';
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to load projects.';
+      showToast(message);
+    }
+  };
+
+  const importLegacyWorkspaceIfNeeded = async () => {
+    if (typeof window === 'undefined') return false;
+
+    const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (!legacy) return false;
+
+    const meRes = await fetch('/api/auth/me', { cache: 'no-store' });
+    if (!meRes.ok) return false;
+    const meBody = (await meRes.json()) as { user?: { id: string } };
+    const userId = meBody.user?.id;
+    if (!userId) return false;
+
+    const markerKey = `${LEGACY_IMPORT_MARKER_PREFIX}${userId}`;
+    if (localStorage.getItem(markerKey) === '1') return false;
+
+    try {
+      const parsed = JSON.parse(legacy) as { projects?: Partial<Project>[] };
+      if (!Array.isArray(parsed.projects) || parsed.projects.length === 0) {
+        localStorage.setItem(markerKey, '1');
+        return false;
+      }
+
+      const importRes = await fetch('/api/projects/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projects: parsed.projects }),
+      });
+      if (!importRes.ok) {
+        const body = (await importRes.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || 'Legacy import failed.');
+      }
+
+      localStorage.setItem(markerKey, '1');
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Legacy import failed.';
+      showToast(message);
+      return false;
+    }
+  };
+
+  const persistProjectToServer = async (project: Project) => {
+    const response = await fetch(`/api/projects/${project.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project }),
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error || 'Failed to save project.');
+    }
+    const payload = (await response.json()) as { project?: Partial<Project> };
+    if (payload.project) {
+      setProjects((prev) =>
+        prev.map((p) => (p.id === project.id ? normalizeProject(payload.project as Partial<Project>) : p))
+      );
+    }
+  };
+
+  const scheduleProjectSave = (project: Project) => {
+    if (!isHydrated || project.id.startsWith('tmp-')) return;
+    const existing = saveTimersRef.current[project.id];
+    if (existing) clearTimeout(existing);
+    saveTimersRef.current[project.id] = setTimeout(() => {
+      void persistProjectToServer(project).catch((error) => {
+        const message = error instanceof Error ? error.message : 'Failed to save project.';
+        showToast(message);
+      });
+    }, 350);
+  };
+
+  // Load from local cache + bootstrap from server
   useEffect(() => {
     try {
-      const stored = localStorage.getItem(STORAGE_KEY);
+      const stored = localStorage.getItem(CACHE_STORAGE_KEY);
       if (stored) {
         const parsed = JSON.parse(stored) as { projects: Partial<Project>[]; activeProjectId: string };
-        if (parsed.projects && Array.isArray(parsed.projects) && parsed.activeProjectId) {
-          // normalize and filter out soft-deleted projects by default
+        if (Array.isArray(parsed.projects)) {
           const visible = parsed.projects.map(normalizeProject).filter((p) => !p.isDeleted);
           setProjects(visible);
-          setActiveProjectId(parsed.activeProjectId);
+          if (parsed.activeProjectId) {
+            setActiveProjectId(parsed.activeProjectId);
+          }
         }
       }
     } catch (error) {
-      console.error('Failed to load workspace from localStorage:', error);
-      // Silently fail and use defaults
+      console.error('Failed to load workspace cache:', error);
     } finally {
       setIsHydrated(true);
     }
   }, []);
 
-  // Persist to localStorage whenever projects or activeProjectId changes
+  // Bootstrap server state once.
+  useEffect(() => {
+    if (bootstrappedRef.current) return;
+    bootstrappedRef.current = true;
+    void (async () => {
+      await loadProjectsFromServer();
+      const imported = await importLegacyWorkspaceIfNeeded();
+      if (imported) {
+        await loadProjectsFromServer();
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const timersRef = saveTimersRef;
+    return () => {
+      Object.values(timersRef.current).forEach((timer) => clearTimeout(timer));
+    };
+  }, []);
+
+  useEffect(() => {
+    if (projects.length === 0) {
+      if (activeProjectId) setActiveProjectId('');
+      return;
+    }
+    if (!projects.some((p) => p.id === activeProjectId)) {
+      setActiveProjectId(projects[0].id);
+    }
+  }, [projects, activeProjectId]);
+
+  // Persist local cache only (optional, not source of truth).
   useEffect(() => {
     if (!isHydrated) return;
     
     try {
-      localStorage.setItem(
-        STORAGE_KEY,
-        JSON.stringify({ projects, activeProjectId })
-      );
+      localStorage.setItem(CACHE_STORAGE_KEY, JSON.stringify({ projects, activeProjectId }));
+      localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, activeProjectId);
     } catch (error) {
-      console.error('Failed to save workspace to localStorage:', error);
-      // Silently fail
+      console.error('Failed to save workspace cache:', error);
     }
   }, [projects, activeProjectId, isHydrated]);
 
@@ -460,18 +533,20 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
     [projects, activeProjectId]
   );
 
-  const showToast = (msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 3000);
-  };
-
   // Helpers to update a specific project
   const updateActiveProject = (updates: Partial<Project>) => {
-    setProjects((prev) =>
-      prev.map((p) =>
-        p.id === activeProjectId ? { ...p, ...updates } : p
-      )
-    );
+    setProjects((prev) => {
+      let updatedProject: Project | null = null;
+      const next = prev.map((p) => {
+        if (p.id !== activeProjectId) return p;
+        updatedProject = normalizeProject({ ...p, ...updates });
+        return updatedProject;
+      });
+      if (updatedProject) {
+        scheduleProjectSave(updatedProject);
+      }
+      return next;
+    });
   };
 
   // Setters for active project (mark dirty)
@@ -511,10 +586,12 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
 
   // Project management
   const createProject = (name: string) => {
+    const cleanName = name.trim() || 'Untitled Project';
+    const tempId = `tmp-${generateId()}`;
     const newProject: Project = {
-      id: generateId(),
-      name,
-      scopeName: name,
+      id: tempId,
+      name: cleanName,
+      scopeName: cleanName,
       sprintDuration: '',
       team: '',
       contextBrief: '',
@@ -532,13 +609,36 @@ export function ScopeProvider({ children }: ScopeProviderProps) {
       refinementQuestionsByStoryId: {},
       refinedOutputByStoryId: {},
       finalOutputByStoryId: {},
-      ownerId: typeof window !== 'undefined' ? localStorage.getItem('currentUserId') || undefined : undefined,
+      ownerId: undefined,
       isDeleted: false,
       deletedAt: null,
       deletedBy: null,
     };
     setProjects((prev) => [...prev, newProject]);
-    setActiveProjectId(newProject.id);
+    setActiveProjectId(tempId);
+
+    void (async () => {
+      try {
+        const response = await fetch('/api/projects', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: cleanName }),
+        });
+        if (!response.ok) {
+          const body = (await response.json().catch(() => ({}))) as { error?: string };
+          throw new Error(body.error || 'Failed to create project.');
+        }
+        const payload = (await response.json()) as { project?: Partial<Project> };
+        if (!payload.project) return;
+        const created = normalizeProject(payload.project);
+        setProjects((prev) => prev.map((p) => (p.id === tempId ? created : p)));
+        setActiveProjectId(created.id);
+      } catch (error) {
+        setProjects((prev) => prev.filter((p) => p.id !== tempId));
+        const message = error instanceof Error ? error.message : 'Failed to create project.';
+        showToast(message);
+      }
+    })();
   };
 
   const setActiveProject = (projectId: string) => {

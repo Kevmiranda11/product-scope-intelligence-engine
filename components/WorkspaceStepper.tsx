@@ -15,14 +15,7 @@ const STEPS = [
 export default function WorkspaceStepper() {
   const {
     activeProject,
-    setScopeName,
-    setSprintDuration,
-    setTeam,
     setActiveStep,
-    generateStoryCandidates,
-    toggleStorySelection,
-    addCustomStory,
-    removeCustomStory,
     deleteActiveProject,
   } = useScope();
 
@@ -221,7 +214,7 @@ function StepContext() {
             Context Brief
           </label>
           <p className="text-xs text-[#6B7280] mb-3">
-            Describe the feature/functionality, rules, constraints, and what's not included. This will be used to generate user stories.
+            Describe the feature/functionality, rules, constraints, and what&apos;s not included. This will be used to generate user stories.
           </p>
           <textarea
             id="contextBrief"
@@ -405,7 +398,7 @@ function StepSelection() {
     <div>
       <h2 className="text-xl font-semibold text-[#E5E7EB] mb-2">Selection</h2>
       <p className="text-[#9CA3AF] mb-8">
-        Keep what you want, remove what you don't, and add missing stories.
+        Keep what you want, remove what you don&apos;t, and add missing stories.
       </p>
 
       {/* Summary */}
@@ -624,8 +617,7 @@ function StepRefinement() {
     return <div className="text-[#9CA3AF]">Loading project...</div>;
   }
 
-  const { storyCandidates, customStories, selectedStoryIds, refinementQuestionsByStoryId, refinedOutputByStoryId } =
-    activeProject;
+  const { storyCandidates, customStories, selectedStoryIds, refinementQuestionsByStoryId } = activeProject;
   const allStories = [...storyCandidates, ...customStories];
   const selectedStories = allStories.filter((s) => selectedStoryIds.includes(s.id));
 
@@ -634,7 +626,7 @@ function StepRefinement() {
   return (
     <div>
       <h2 className="text-xl font-semibold text-[#E5E7EB] mb-2">Refinement</h2>
-      <p className="text-[#9CA3AF] mb-8">Answer the team's questions to finalize scope.</p>
+      <p className="text-[#9CA3AF] mb-8">Answer the team&apos;s questions to finalize scope.</p>
 
       {selectedStories.length === 0 ? (
         <div className="p-6 rounded-md border border-[#262C36] bg-[#1C212B]">
@@ -733,13 +725,21 @@ function StepRefinement() {
 }
 
 function StepOutput() {
-  const { activeProject, generateFinalOutput, isGeneratingFinalOutput } = useScope();
+  const { activeProject, generateFinalOutput, isGeneratingFinalOutput, showToast } = useScope();
+  const [azdoProjects, setAzdoProjects] = useState<Array<{ id: string; name: string }>>([]);
+  const [azdoEpics, setAzdoEpics] = useState<Array<{ id: number; title: string }>>([]);
+  const [selectedAzdoProject, setSelectedAzdoProject] = useState('');
+  const [selectedEpicId, setSelectedEpicId] = useState('');
+  const [isLoadingAzdoProjects, setIsLoadingAzdoProjects] = useState(false);
+  const [isLoadingAzdoEpics, setIsLoadingAzdoEpics] = useState(false);
+  const [isExportingAzdo, setIsExportingAzdo] = useState(false);
+  const [lastExportSummary, setLastExportSummary] = useState<string | null>(null);
 
-  if (!activeProject) {
-    return <div className="text-[#9CA3AF]">Loading project...</div>;
-  }
-
-  const { storyCandidates, customStories, selectedStoryIds, refinedOutputByStoryId, finalOutputByStoryId } = activeProject;
+  const storyCandidates = activeProject?.storyCandidates ?? [];
+  const customStories = activeProject?.customStories ?? [];
+  const selectedStoryIds = activeProject?.selectedStoryIds ?? [];
+  const refinedOutputByStoryId = activeProject?.refinedOutputByStoryId ?? {};
+  const finalOutputByStoryId = activeProject?.finalOutputByStoryId ?? {};
   const allStories = [...storyCandidates, ...customStories];
   const selectedRefinedStories = allStories
     .filter((story) => selectedStoryIds.includes(story.id))
@@ -759,6 +759,105 @@ function StepOutput() {
     .filter((entry) => Boolean(entry.output));
 
   const hasPendingFinalOutputs = selectedRefinedStories.length > finalOutputs.length;
+
+  const loadAzureProjects = async () => {
+    setIsLoadingAzdoProjects(true);
+    try {
+      const res = await fetch('/api/devops/projects', { cache: 'no-store' });
+      const body = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        projects?: Array<{ id: string; name: string }>;
+      };
+      if (!res.ok) {
+        throw new Error(body.error || 'Failed to load Azure DevOps projects.');
+      }
+      const projects = body.projects || [];
+      setAzdoProjects(projects);
+      setSelectedAzdoProject((prev) => (prev && projects.some((p) => p.name === prev) ? prev : projects[0]?.name || ''));
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Failed to load Azure DevOps projects.');
+    } finally {
+      setIsLoadingAzdoProjects(false);
+    }
+  };
+
+  const loadEpics = async (projectName: string) => {
+    if (!projectName) {
+      setAzdoEpics([]);
+      setSelectedEpicId('');
+      return;
+    }
+    setIsLoadingAzdoEpics(true);
+    try {
+      const res = await fetch(`/api/devops/epics?project=${encodeURIComponent(projectName)}`, {
+        cache: 'no-store',
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        epics?: Array<{ id: number; title: string }>;
+      };
+      if (!res.ok) {
+        throw new Error(body.error || 'Failed to load epics.');
+      }
+      const epics = body.epics || [];
+      setAzdoEpics(epics);
+      setSelectedEpicId(epics[0] ? String(epics[0].id) : '');
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Failed to load epics.');
+    } finally {
+      setIsLoadingAzdoEpics(false);
+    }
+  };
+
+  useEffect(() => {
+    if (finalOutputs.length === 0) return;
+    void loadAzureProjects();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id, finalOutputs.length]);
+
+  useEffect(() => {
+    void loadEpics(selectedAzdoProject);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAzdoProject]);
+
+  const exportToAzureDevOps = async () => {
+    if (!activeProject) return;
+    if (!selectedAzdoProject) {
+      showToast('Select an Azure DevOps project.');
+      return;
+    }
+    setIsExportingAzdo(true);
+    try {
+      const res = await fetch('/api/devops/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId: activeProject.id,
+          azureProjectName: selectedAzdoProject,
+          epicWorkItemId: selectedEpicId ? Number(selectedEpicId) : null,
+        }),
+      });
+      const body = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        createdCount?: number;
+        updatedCount?: number;
+      };
+      if (!res.ok) {
+        throw new Error(body.error || 'Failed to export to Azure DevOps.');
+      }
+      const summary = `Export completed. Created ${body.createdCount ?? 0}, updated ${body.updatedCount ?? 0}.`;
+      setLastExportSummary(summary);
+      showToast(summary);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : 'Failed to export to Azure DevOps.');
+    } finally {
+      setIsExportingAzdo(false);
+    }
+  };
+
+  if (!activeProject) {
+    return <div className="text-[#9CA3AF]">Loading project...</div>;
+  }
 
   return (
     <div>
@@ -904,6 +1003,77 @@ function StepOutput() {
               Some stories were updated after the last run. Generate again to refresh all outputs.
             </p>
           )}
+
+          <div className="mt-8 p-4 rounded-md border border-[#262C36] bg-[#1C212B]">
+            <div className="flex items-center justify-between gap-4 mb-4">
+              <div>
+                <p className="text-sm font-medium text-[#E5E7EB]">Azure DevOps Export</p>
+                <p className="text-xs text-[#9CA3AF] mt-1">
+                  Select project and epic, then export generated features and user stories.
+                </p>
+              </div>
+              <button
+                onClick={() => void loadAzureProjects()}
+                disabled={isLoadingAzdoProjects}
+                className={`px-3 py-1.5 text-xs rounded border ${
+                  isLoadingAzdoProjects
+                    ? 'text-[#6B7280] border-[#262C36] cursor-not-allowed'
+                    : 'text-[#E5E7EB] border-[#262C36] hover:border-[#3F46E1]'
+                }`}
+              >
+                {isLoadingAzdoProjects ? 'Refreshing...' : 'Refresh'}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+              <div>
+                <label className="block text-xs text-[#9CA3AF] mb-1">Azure Project</label>
+                <select
+                  value={selectedAzdoProject}
+                  onChange={(e) => setSelectedAzdoProject(e.target.value)}
+                  className="w-full px-3 py-2 text-sm rounded-md bg-[#0F1115] border border-[#262C36] text-[#E5E7EB]"
+                >
+                  <option value="">Select project</option>
+                  {azdoProjects.map((project) => (
+                    <option key={project.id} value={project.name}>
+                      {project.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs text-[#9CA3AF] mb-1">Epic (optional)</label>
+                <select
+                  value={selectedEpicId}
+                  onChange={(e) => setSelectedEpicId(e.target.value)}
+                  disabled={!selectedAzdoProject || isLoadingAzdoEpics}
+                  className="w-full px-3 py-2 text-sm rounded-md bg-[#0F1115] border border-[#262C36] text-[#E5E7EB] disabled:text-[#6B7280]"
+                >
+                  <option value="">{isLoadingAzdoEpics ? 'Loading epics...' : 'No parent epic'}</option>
+                  {azdoEpics.map((epic) => (
+                    <option key={epic.id} value={epic.id}>
+                      #{epic.id} - {epic.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <button
+              onClick={() => void exportToAzureDevOps()}
+              disabled={isExportingAzdo || !selectedAzdoProject || finalOutputs.length === 0}
+              className={`px-4 py-2 text-sm font-medium rounded-md border transition-colors ${
+                isExportingAzdo || !selectedAzdoProject || finalOutputs.length === 0
+                  ? 'bg-[#1C212B] text-[#6B7280] border-[#262C36] cursor-not-allowed'
+                  : 'bg-[#10B981] text-white border-[#10B981] hover:bg-[#059669]'
+              }`}
+            >
+              {isExportingAzdo ? 'Exporting...' : 'Export to Azure DevOps'}
+            </button>
+
+            {lastExportSummary && <p className="text-xs text-[#9CA3AF] mt-3">{lastExportSummary}</p>}
+          </div>
         </>
       )}
     </div>

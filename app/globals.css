@@ -49,6 +49,8 @@
 
 :root {
   --radius: 0.625rem;
+  --font-geist-sans: ui-sans-serif, system-ui, sans-serif;
+  --font-geist-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   /* dark-first colors (same as .dark) */
   --background: #0F1115;
   --foreground: #E5E7EB;

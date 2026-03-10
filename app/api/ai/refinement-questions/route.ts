@@ -4,12 +4,14 @@ import {
   refinementQuestionsResponseSchema,
   type RefinementQuestionsResponse,
 } from '@/lib/server/ai-contract';
+import { AuthError, applySessionCookie, requireUser } from '@/lib/server/auth';
 import { generateStructuredOutput, isOpenAIConfigured } from '@/lib/server/openai';
 
 export const runtime = 'nodejs';
 
 export async function POST(request: NextRequest) {
   try {
+    const context = await requireUser(request);
     const body = (await request.json()) as unknown;
 
     if (!isRefinementQuestionsRequest(body)) {
@@ -49,8 +51,15 @@ export async function POST(request: NextRequest) {
       },
     });
 
-    return NextResponse.json(result);
+    const response = NextResponse.json(result);
+    if (context.rotatedToken) {
+      applySessionCookie(response, context.rotatedToken);
+    }
+    return response;
   } catch (error) {
+    if (error instanceof AuthError) {
+      return NextResponse.json({ error: error.message }, { status: error.status });
+    }
     const message = error instanceof Error ? error.message : 'Unknown server error.';
     return NextResponse.json({ error: message }, { status: 500 });
   }

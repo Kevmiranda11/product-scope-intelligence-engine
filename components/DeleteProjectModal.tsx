@@ -24,16 +24,9 @@ export default function DeleteProjectModal({ projectId, projectName, onClose, on
     if (!canSubmit) return;
     setLoading(true);
     try {
-      const userId = typeof window !== 'undefined' ? localStorage.getItem('currentUserId') : undefined;
-      const userRole = typeof window !== 'undefined' ? localStorage.getItem('currentUserRole') : undefined;
-
       const res = await fetch(`/api/projects/${projectId}`, {
         method: 'DELETE',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': userId || '',
-          'x-user-role': userRole || '',
-        },
+        headers: { 'Content-Type': 'application/json' },
       });
 
       if (!res.ok) {
@@ -45,10 +38,12 @@ export default function DeleteProjectModal({ projectId, projectName, onClose, on
 
       // success: show toast + redirect to root (project list)
       showToast(`Project '${projectName}' deleted.`);
-      onDeleted && onDeleted();
+      if (onDeleted) {
+        onDeleted();
+      }
       onClose();
       router.push('/');
-    } catch (e) {
+    } catch {
       setError('Failed to delete project');
     } finally {
       setLoading(false);
@@ -61,7 +56,7 @@ export default function DeleteProjectModal({ projectId, projectName, onClose, on
       <div className="relative w-full max-w-lg p-6 bg-[#0F1115] rounded-md border border-[#262C36]">
         <h3 className="text-lg font-semibold text-[#E5E7EB] mb-2">Delete project</h3>
         <p className="text-sm text-[#9CA3AF] mb-4">
-          Are you sure you want to delete the project "{projectName}"?
+          Are you sure you want to delete the project &quot;{projectName}&quot;?
         </p>
 
         {error && <p className="text-sm text-[#F87171] mb-3">{error}</p>}
